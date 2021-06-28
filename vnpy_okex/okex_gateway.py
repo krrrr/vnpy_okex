@@ -14,7 +14,7 @@ import time
 from copy import copy
 from datetime import datetime
 from urllib.parse import urlencode
-from typing import Dict, List, Set
+from typing import Dict, List, Set, Tuple
 from types import TracebackType
 
 from requests import Response
@@ -76,7 +76,8 @@ STATUS_OKEX2VT: Dict[str, Status] = {
 ORDERTYPE_OKEX2VT: Dict[str, OrderType] = {
     "limit": OrderType.LIMIT,
     "fok": OrderType.FOK,
-    "ioc": OrderType.FAK
+    "ioc": OrderType.FAK,
+    "post_only": OrderType.LIMIT
 }
 ORDERTYPE_VT2OKEX: Dict[OrderType, str] = {v: k for k, v in ORDERTYPE_OKEX2VT.items()}
 
@@ -92,6 +93,16 @@ INTERVAL_VT2OKEX: Dict[Interval, str] = {
     Interval.MINUTE: "1m",
     Interval.HOUR: "1H",
     Interval.DAILY: "1D",
+}
+
+# offset映射
+OFFSET_OKEX2VT: Dict[Tuple[str, str], Offset] = {
+    ("net", "buy") : Offset.OPEN,
+    ("net", "sell") : Offset.CLOSE,
+    ("long", "buy"): Offset.OPEN,
+    ("long", "sell"): Offset.CLOSE,
+    ("short", "buy"): Offset.CLOSE,
+    ("short", "sell"): Offset.OPEN,
 }
 
 # 产品类型映射
@@ -713,7 +724,7 @@ class OkexWebsocketPrivateApi(WebsocketClient):
 
             # 检查是否有成交
             if d["fillSz"] == "0":
-                return
+                continue
 
             # 将成交数量四舍五入到正确精度
             trade_volume: float = float(d["fillSz"])
@@ -731,6 +742,7 @@ class OkexWebsocketPrivateApi(WebsocketClient):
                 price=float(d["fillPx"]),
                 volume=trade_volume,
                 datetime=parse_timestamp(d["uTime"]),
+                commission=float(d['fillFee']),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_trade(trade)
@@ -962,7 +974,7 @@ def parse_order_data(data: dict, gateway_name: str) -> OrderData:
         type=ORDERTYPE_OKEX2VT[data["ordType"]],
         orderid=order_id,
         direction=DIRECTION_OKEX2VT[data["side"]],
-        offset=Offset.NONE,
+        offset=OFFSET_OKEX2VT[(data["posSide"], data["side"])],
         traded=float(data["accFillSz"]),
         price=float(data["px"]),
         volume=float(data["sz"]),
