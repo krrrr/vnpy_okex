@@ -742,7 +742,7 @@ class OkexWebsocketPrivateApi(WebsocketClient):
                 price=float(d["fillPx"]),
                 volume=trade_volume,
                 datetime=parse_timestamp(d["uTime"]),
-                commission=float(d['fillFee']),
+                commission=abs(float(d['fillFee'])),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_trade(trade)
