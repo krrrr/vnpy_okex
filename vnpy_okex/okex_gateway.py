@@ -4,7 +4,6 @@
 3. 只支持单向持仓模式
 """
 
-
 import base64
 import hashlib
 import hmac
@@ -97,8 +96,8 @@ INTERVAL_VT2OKEX: Dict[Interval, str] = {
 
 # offset映射
 OFFSET_OKEX2VT: Dict[Tuple[str, str], Offset] = {
-    ("net", "buy") : Offset.OPEN,
-    ("net", "sell") : Offset.CLOSE,
+    ("net", "buy"): Offset.OPEN,
+    ("net", "sell"): Offset.CLOSE,
     ("long", "buy"): Offset.OPEN,
     ("long", "sell"): Offset.CLOSE,
     ("short", "buy"): Offset.CLOSE,
@@ -153,6 +152,8 @@ class OkexGateway(BaseGateway):
         self.ws_private_api: "OkexWebsocketPrivateApi" = OkexWebsocketPrivateApi(self)
 
         self.orders: Dict[str, OrderData] = {}
+        self.last_trade_id = 0
+        self.last_connect_server_time = ''
 
     def connect(self, setting: dict) -> None:
         """连接交易接口"""
@@ -230,6 +231,20 @@ class OkexGateway(BaseGateway):
     def get_order(self, orderid: str) -> OrderData:
         """查询委托数据"""
         return self.orders.get(orderid, None)
+
+    def on_reconnect(self):
+        self.rest_api.query_trade()
+        self.rest_api.query_order_history()
+        self.rest_api.query_time()
+
+    def get_last_active_order(self):
+        last_order = None
+        for order in self.orders:
+            last_order = order
+            if order.is_active():
+                break
+
+        return last_order
 
 
 class OkexRestApi(RestClient):
@@ -310,6 +325,70 @@ class OkexRestApi(RestClient):
             callback=self.on_query_order,
         )
 
+    def query_trade(self) -> None:
+        self.add_request("GET", "/api/v5/trade/fills", callback=self.on_query_trade)
+
+    def on_query_trade(self, packet: dict, request: Request) -> None:
+        for d in packet["data"]:
+            # 将成交数量四舍五入到正确精度
+            trade_volume: float = float(d["fillSz"])
+            symbol_id = d['instId']
+            ts = d['ts']
+            trade_id = d['tradeId']
+
+            # assume trade id is increasing
+            if ts < self.gateway.last_connect_server_time or int(trade_id) <= self.gateway.last_trade_id:
+                continue
+
+            contract: ContractData = symbol_contract_map.get(symbol_id, None)
+            if contract:
+                trade_volume = round_to(trade_volume, contract.min_volume)
+
+            trade: TradeData = TradeData(
+                symbol=symbol_id,
+                exchange=Exchange.OKEX,
+                orderid=d['clOrdId'],
+                tradeid=trade_id,
+                direction=DIRECTION_OKEX2VT[d["side"]],
+                offset=OFFSET_OKEX2VT[(d["posSide"], d["side"])],
+                price=float(d["fillPx"]),
+                volume=trade_volume,
+                datetime=parse_timestamp(ts),
+                commission=abs(float(d['fee'])),
+                gateway_name=self.gateway_name,
+            )
+
+            self.gateway.on_trade(trade)
+
+        self.gateway.write_log("Query Trade Success")
+
+    def query_order_history(self) -> None:
+        self.add_request("GET", "/api/v5/trade/orders-history", params={'instType': 'SWAP'},
+                         callback=self.on_query_history_order)
+
+    def on_query_history_order(self, packet: dict, request: Request) -> None:
+        last_active_order = self.gateway.get_last_active_order()
+        if last_active_order is None:
+            last_order_time = None
+        else:
+            last_order_time = last_active_order.datetime
+
+        for order_info in packet["data"]:
+            if order_info['cTime'] < self.gateway.last_connect_server_time:
+                continue
+
+            order: OrderData = parse_order_data(
+                order_info,
+                self.gateway_name
+            )
+
+            if last_order_time and order.datetime < last_order_time:
+                continue
+
+            self.gateway.on_order(order)
+
+        self.gateway.write_log("委托信息查询成功")
+
     def query_time(self) -> None:
         """查询时间"""
         self.add_request(
@@ -335,6 +414,7 @@ class OkexRestApi(RestClient):
         server_time: datetime = datetime.fromtimestamp(timestamp / 1000)
         local_time: datetime = datetime.now()
         msg: str = f"服务器时间：{server_time}，本机时间：{local_time}"
+        self.gateway.last_connect_server_time = packet["data"][0]["ts"]
         self.gateway.write_log(msg)
 
     def on_error(
@@ -634,6 +714,7 @@ class OkexWebsocketPrivateApi(WebsocketClient):
         self.reqid: int = 0
         self.order_count: int = 0
         self.connect_time: int = 0
+        self.disconnect_count = 0
 
         self.callbacks: Dict[str, callable] = {
             "login": self.on_login,
@@ -674,10 +755,13 @@ class OkexWebsocketPrivateApi(WebsocketClient):
         """连接成功回报"""
         self.gateway.write_log("Websocket Private API连接成功")
         self.login()
+        if self.disconnect_count >= 1:
+            self.gateway.on_reconnect()
 
     def on_disconnected(self) -> None:
         """连接断开回报"""
         self.gateway.write_log("Websocket Private API连接断开")
+        self.disconnect_count += 1
 
     def on_packet(self, packet: dict) -> None:
         """推送数据回报"""
@@ -746,6 +830,7 @@ class OkexWebsocketPrivateApi(WebsocketClient):
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_trade(trade)
+            self.gateway.last_trade_id = int(d['tradeId'])
 
     def on_account(self, packet: dict) -> None:
         """资金更新推送"""
